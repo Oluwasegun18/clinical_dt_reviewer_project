@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Cluster/runtime outputs
+logs/*
+!logs/.gitkeep
+results_reviewer/*
+!results_reviewer/.gitkeep
+slurm-*.out
+*.err
+*.out
+
+# Data/cache
+/data/*
+!/data/.gitkeep
+!/data/README.md
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
