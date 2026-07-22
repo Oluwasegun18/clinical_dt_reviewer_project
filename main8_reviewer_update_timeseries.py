@@ -112,6 +112,38 @@ class TabularMLP(nn.Module):
             x = x.view(x.size(0), -1)
         return self.net(x)
 
+class ClinicalTimeSeriesGRU(nn.Module):
+    """Compact GRU classifier for patient-level physiological time-series prediction.
+
+    Expected input shape: [batch, time_steps, num_features]. This model is used for
+    the added predictive clinical task, such as ICU in-hospital mortality prediction
+    from the first 48 hours of physiological and laboratory measurements.
+    """
+    def __init__(self, input_dim, hidden=64, num_layers=1, num_classes=2, dropout=0.1):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.hidden = int(hidden)
+        self.gru = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=self.hidden,
+            num_layers=int(num_layers),
+            batch_first=True,
+            dropout=float(dropout) if int(num_layers) > 1 else 0.0,
+        )
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.hidden),
+            nn.Linear(self.hidden, self.hidden),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden, int(num_classes)),
+        )
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        _, h = self.gru(x.float())
+        return self.classifier(h[-1])
+
 class MNISTCNN(nn.Module):
     """Small CNN for MNIST (1x28x28)."""
     def __init__(self, num_classes=10):
@@ -511,6 +543,248 @@ class ClinicalDataset(Dataset):
         self.y = torch.from_numpy(y).long()
     def __len__(self): return len(self.y)
     def __getitem__(self, i): return self.X[i], self.y[i]
+
+
+class ClinicalTimeSeriesDataset(Dataset):
+    """Patient-level sequence dataset for predictive clinical tasks."""
+    def __init__(self, X, y):
+        self.X = torch.from_numpy(np.asarray(X, dtype=np.float32))
+        self.y = torch.from_numpy(np.asarray(y, dtype=np.int64))
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+
+def _pad_or_truncate_sequence(arr: np.ndarray, max_seq_len: int) -> np.ndarray:
+    """Return a fixed-length [max_seq_len, feature_dim] sequence.
+
+    We keep the most recent observations when the sequence is too long and left-pad
+    shorter sequences with zeros. Because features are standardized using the
+    training set, zero padding corresponds approximately to population-normal values.
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if len(arr) >= max_seq_len:
+        return arr[-max_seq_len:].astype(np.float32)
+    pad = np.zeros((max_seq_len - len(arr), arr.shape[1]), dtype=np.float32)
+    return np.vstack([pad, arr]).astype(np.float32)
+
+
+def load_timeseries_csv(
+    path: str,
+    patient_col: str,
+    time_col: str,
+    target_col: str,
+    max_seq_len: int = 48,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    feature_cols: str = "",
+):
+    """Load a generic long-format clinical time-series CSV.
+
+    Required CSV format: one row per patient-time observation. The target must be
+    patient-level and may be repeated across rows. Example columns:
+        patient_id, hour, heart_rate, spo2, sbp, creatinine, mortality
+
+    Use --ts_feature_cols to explicitly choose features. If omitted, all numeric
+    columns except patient/time/target are used.
+    """
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Time-series CSV not found: {path}")
+    df = pd.read_csv(path)
+    for col in [patient_col, time_col, target_col]:
+        if col not in df.columns:
+            raise ValueError(f"Required column '{col}' not found in {path}")
+
+    if feature_cols:
+        feats = [c.strip() for c in feature_cols.split(',') if c.strip()]
+    else:
+        exclude = {patient_col, time_col, target_col}
+        feats = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+    if not feats:
+        raise ValueError("No numeric time-series feature columns found. Use --ts_feature_cols.")
+
+    # Patient-level split to prevent leakage across train/test.
+    patient_targets = df.groupby(patient_col)[target_col].first().reset_index()
+    y_patient_raw = patient_targets[target_col]
+    if y_patient_raw.dtype.kind in "OUS":
+        y_patient = pd.factorize(y_patient_raw.astype(str).str.strip())[0]
+    else:
+        y_patient = pd.to_numeric(y_patient_raw, errors='coerce').fillna(0).astype(int).values
+    pids = patient_targets[patient_col].values
+    stratify = y_patient if len(np.unique(y_patient)) > 1 and min(np.bincount(y_patient)) >= 2 else None
+    p_train, p_test, y_train_pid, y_test_pid = train_test_split(
+        pids, y_patient, test_size=test_size, random_state=random_state, stratify=stratify
+    )
+    train_set = set(p_train.tolist())
+
+    # Scale based only on training observations.
+    train_rows = df[df[patient_col].isin(train_set)]
+    med = train_rows[feats].median(numeric_only=True)
+    scaler = StandardScaler().fit(train_rows[feats].fillna(med).values.astype(float))
+
+    def build_arrays(patient_ids):
+        X_list, y_list = [], []
+        pid_to_y = dict(zip(patient_targets[patient_col].values, y_patient))
+        for pid in patient_ids:
+            g = df[df[patient_col] == pid].sort_values(time_col)
+            vals = g[feats].fillna(med).values.astype(float)
+            vals = scaler.transform(vals)
+            X_list.append(_pad_or_truncate_sequence(vals, max_seq_len))
+            y_list.append(int(pid_to_y[pid]))
+        return np.asarray(X_list, dtype=np.float32), np.asarray(y_list, dtype=np.int64)
+
+    X_train, y_train = build_arrays(p_train)
+    X_test, y_test = build_arrays(p_test)
+    num_classes = int(len(np.unique(y_patient)))
+    return ClinicalTimeSeriesDataset(X_train, y_train), ClinicalTimeSeriesDataset(X_test, y_test), len(feats), num_classes, feats
+
+
+def _time_to_hour(t) -> Optional[int]:
+    """Convert PhysioNet 2012 HH:MM timestamps to integer hour bins."""
+    try:
+        if pd.isna(t): return None
+        parts = str(t).strip().split(':')
+        if len(parts) < 2: return None
+        h = int(float(parts[0])); m = int(float(parts[1]))
+        return max(0, min(47, h + (1 if m >= 30 else 0)))
+    except Exception:
+        return None
+
+
+def load_physionet2012(
+    data_dir: str,
+    set_name: str = "a",
+    max_seq_len: int = 48,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    target_col: str = "In-hospital_death",
+):
+    """Load PhysioNet/CinC Challenge 2012 raw ICU time-series records.
+
+    Expected folder contents after extracting the PhysioNet 2012 data:
+      - many patient record files such as 132539.txt
+      - an outcome file such as Outcomes-a.txt, Outcomes-b.txt, or Outcomes-c.txt
+
+    The loader bins measurements into hourly intervals over the first 48 hours and
+    creates a patient-level mortality-prediction dataset.
+    """
+    if not data_dir or not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"PhysioNet 2012 directory not found: {data_dir}")
+    outcome_candidates = [
+        os.path.join(data_dir, f"Outcomes-{set_name}.txt"),
+        os.path.join(data_dir, f"Outcomes-{set_name.upper()}.txt"),
+        os.path.join(data_dir, "Outcomes.txt"),
+    ]
+    outcome_path = next((x for x in outcome_candidates if os.path.exists(x)), None)
+    if outcome_path is None:
+        raise FileNotFoundError(
+            f"Could not find Outcomes-{set_name}.txt in {data_dir}."
+        )
+    outcomes = pd.read_csv(outcome_path)
+    if "RecordID" not in outcomes.columns or target_col not in outcomes.columns:
+        raise ValueError(f"Outcome file must contain RecordID and {target_col}: {outcome_path}")
+    outcomes = outcomes.dropna(subset=[target_col])
+    outcomes["RecordID"] = outcomes["RecordID"].astype(str)
+    y_map = dict(zip(outcomes["RecordID"], outcomes[target_col].astype(int)))
+
+    record_files = []
+    for rid in outcomes["RecordID"]:
+        f = os.path.join(data_dir, f"{rid}.txt")
+        if os.path.exists(f):
+            record_files.append((rid, f))
+    if not record_files:
+        raise FileNotFoundError(f"No patient record .txt files matching Outcomes were found in {data_dir}")
+
+    # Discover variables from all records. Exclude identifiers that are not signals.
+    exclude_params = {"RecordID"}
+    variables = set()
+    for _, f in record_files:
+        try:
+            g = pd.read_csv(f)
+            variables.update([str(x) for x in g.get("Parameter", []) if str(x) not in exclude_params])
+        except Exception:
+            continue
+    variables = sorted(variables)
+    if not variables:
+        raise ValueError("No physiological/laboratory variables found in PhysioNet records.")
+    var_to_idx = {v: i for i, v in enumerate(variables)}
+
+    X_raw, y, rids = [], [], []
+    for rid, f in record_files:
+        g = pd.read_csv(f)
+        seq = np.full((max_seq_len, len(variables)), np.nan, dtype=np.float32)
+        static_vals = {}
+        for _, row in g.iterrows():
+            param = str(row.get("Parameter", ""))
+            if param not in var_to_idx:
+                continue
+            try:
+                val = float(row.get("Value"))
+            except Exception:
+                continue
+            hour = _time_to_hour(row.get("Time"))
+            if hour is None:
+                continue
+            if hour == 0 and param in {"Age", "Gender", "Height", "ICUType", "Weight"}:
+                static_vals[param] = val
+            seq[min(hour, max_seq_len - 1), var_to_idx[param]] = val
+        # Repeat static values through the window.
+        for param, val in static_vals.items():
+            if param in var_to_idx:
+                seq[:, var_to_idx[param]] = val
+        X_raw.append(seq)
+        y.append(int(y_map[rid]))
+        rids.append(rid)
+
+    X_raw = np.asarray(X_raw, dtype=np.float32)
+    y = np.asarray(y, dtype=np.int64)
+    idx = np.arange(len(y))
+    stratify = y if len(np.unique(y)) > 1 and min(np.bincount(y)) >= 2 else None
+    train_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=random_state, stratify=stratify)
+
+    # Impute and scale using training statistics only.
+    train_flat = X_raw[train_idx].reshape(-1, X_raw.shape[-1])
+    med = np.nanmedian(train_flat, axis=0)
+    med = np.where(np.isfinite(med), med, 0.0)
+    X_imp = np.where(np.isnan(X_raw), med.reshape(1, 1, -1), X_raw)
+    scaler = StandardScaler().fit(X_imp[train_idx].reshape(-1, X_raw.shape[-1]))
+    X_scaled = scaler.transform(X_imp.reshape(-1, X_raw.shape[-1])).reshape(X_imp.shape).astype(np.float32)
+
+    train_ds = ClinicalTimeSeriesDataset(X_scaled[train_idx], y[train_idx])
+    test_ds = ClinicalTimeSeriesDataset(X_scaled[test_idx], y[test_idx])
+    return train_ds, test_ds, len(variables), 2, variables
+
+
+def load_synthetic_physio_ts(
+    n_patients: int = 1200,
+    max_seq_len: int = 48,
+    n_features: int = 12,
+    test_size: float = 0.2,
+    random_state: int = 42,
+):
+    """Synthetic physiological time-series task for local smoke tests only.
+
+    This is not intended as the final paper dataset. It helps verify the GRU, FL,
+    Byzantine attacks, and plotting workflow before running a real ICU dataset.
+    """
+    rng = np.random.default_rng(random_state)
+    X = rng.normal(0, 1, size=(n_patients, max_seq_len, n_features)).astype(np.float32)
+    trend = np.linspace(0, 1, max_seq_len).reshape(1, max_seq_len)
+    risk_score = (
+        0.8 * X[:, -12:, 0].mean(axis=1)
+        - 0.5 * X[:, -12:, 1].mean(axis=1)
+        + 0.4 * X[:, :, 2].std(axis=1)
+        + 0.8 * (X[:, :, 3] * trend).mean(axis=1)
+        + rng.normal(0, 0.35, size=n_patients)
+    )
+    prob = 1.0 / (1.0 + np.exp(-risk_score))
+    y = (prob > np.quantile(prob, 0.72)).astype(np.int64)
+    idx = np.arange(n_patients)
+    train_idx, test_idx = train_test_split(idx, test_size=test_size, random_state=random_state, stratify=y)
+    scaler = StandardScaler().fit(X[train_idx].reshape(-1, n_features))
+    Xs = scaler.transform(X.reshape(-1, n_features)).reshape(X.shape).astype(np.float32)
+    return ClinicalTimeSeriesDataset(Xs[train_idx], y[train_idx]), ClinicalTimeSeriesDataset(Xs[test_idx], y[test_idx]), n_features, 2, [f"v{i}" for i in range(n_features)]
 
 
 def load_csv_generic(path, target_col, test_size=0.1, random_state=42):
@@ -924,6 +1198,7 @@ ATTACK_TYPES = (
 )
 
 # ROBUST_METHODS = ("krum", "multikrum", "median", "trimmed_mean", "bulyan")
+
 ROBUST_METHODS = ("multikrum", "median")
 
 ADAPTIVE_METHODS = {
@@ -1279,6 +1554,12 @@ def clinical_relevance(metrics, domain):
             return 0.8*metrics['recall'] + 0.2*metrics['acc']
         else:  # multiclass Stage
             return 0.9*metrics['acc'] + 0.1*metrics['f1']
+    if d.startswith('physionet2012') or d.startswith('timeseries_csv') or d.startswith('synthetic_physio_ts'):
+        # Predictive clinical time-series tasks are usually imbalanced; emphasize
+        # AUC and recall while retaining F1 as a calibration against trivial recall.
+        if metrics['auc'] > 0:
+            return 0.8*metrics['auc'] + 0.1*metrics['recall'] + 0.1*metrics['f1']
+        return 0.1*metrics['f1'] + 0.9*metrics['acc']
     # Generic multiclass
     return 0.9*metrics['acc'] + 0.1*metrics['f1']
 
@@ -1382,6 +1663,61 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
         testset = test
         is_binary = (num_classes == 2)
         domain_for_rel = 'organsmnist'
+
+    elif args.dataset=="synthetic_physio_ts":
+        train, test, input_dim, num_classes, feature_names = load_synthetic_physio_ts(
+            n_patients=args.synthetic_ts_patients,
+            max_seq_len=args.ts_max_len,
+            n_features=args.synthetic_ts_features,
+            test_size=args.ts_test_size,
+            random_state=seed,
+        )
+        print(f"synthetic physiological time-series: patients={len(train)+len(test)}, seq_len={args.ts_max_len}, features={input_dim}, num_classes={num_classes}")
+        y = train.y.numpy()
+        client_idx = dirichlet_partition(y, args.clients, args.dirichlet_alpha)
+        clients = [DataLoader(Subset(train, idx), batch_size=args.batch_size, shuffle=True) for idx in client_idx]
+        model_fn = lambda: ClinicalTimeSeriesGRU(input_dim=input_dim, hidden=args.ts_hidden, num_layers=args.ts_layers, num_classes=num_classes, dropout=args.ts_dropout)
+        testset = test
+        is_binary = (num_classes == 2)
+        domain_for_rel = 'synthetic_physio_ts'
+
+    elif args.dataset=="timeseries_csv":
+        train, test, input_dim, num_classes, feature_names = load_timeseries_csv(
+            path=args.ts_csv,
+            patient_col=args.ts_patient_col,
+            time_col=args.ts_time_col,
+            target_col=args.ts_target_col,
+            max_seq_len=args.ts_max_len,
+            test_size=args.ts_test_size,
+            random_state=seed,
+            feature_cols=args.ts_feature_cols,
+        )
+        print(f"clinical time-series CSV: train={len(train)}, test={len(test)}, seq_len={args.ts_max_len}, features={input_dim}, num_classes={num_classes}")
+        y = train.y.numpy()
+        client_idx = dirichlet_partition(y, args.clients, args.dirichlet_alpha)
+        clients = [DataLoader(Subset(train, idx), batch_size=args.batch_size, shuffle=True) for idx in client_idx]
+        model_fn = lambda: ClinicalTimeSeriesGRU(input_dim=input_dim, hidden=args.ts_hidden, num_layers=args.ts_layers, num_classes=num_classes, dropout=args.ts_dropout)
+        testset = test
+        is_binary = (num_classes == 2)
+        domain_for_rel = 'timeseries_csv'
+
+    elif args.dataset=="physionet2012":
+        train, test, input_dim, num_classes, feature_names = load_physionet2012(
+            data_dir=args.physionet2012_dir,
+            set_name=args.physionet2012_set,
+            max_seq_len=args.ts_max_len,
+            test_size=args.ts_test_size,
+            random_state=seed,
+            target_col=args.physionet2012_target,
+        )
+        print(f"PhysioNet 2012 ICU time-series: train={len(train)}, test={len(test)}, seq_len={args.ts_max_len}, features={input_dim}, num_classes={num_classes}")
+        y = train.y.numpy()
+        client_idx = dirichlet_partition(y, args.clients, args.dirichlet_alpha)
+        clients = [DataLoader(Subset(train, idx), batch_size=args.batch_size, shuffle=True) for idx in client_idx]
+        model_fn = lambda: ClinicalTimeSeriesGRU(input_dim=input_dim, hidden=args.ts_hidden, num_layers=args.ts_layers, num_classes=num_classes, dropout=args.ts_dropout)
+        testset = test
+        is_binary = (num_classes == 2)
+        domain_for_rel = 'physionet2012'
 
     else:
         raise ValueError("Unknown dataset")
@@ -1786,7 +2122,8 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
 
             ema = args.server_momentum
             if r < 5:
-                ema = 0.001 #0.01
+                ema = 0.0001
+
             # for dir_alpha = 0.01 x_round = 5, for  dir_alpha = 0.05 x_round = 10
             x_round=20 #0<= x_round<=0 rounds/2 :: This is to adjust the round in which the momentum starts, such that the momentum starts at round, total_round/2 + x_round 
             if args.final_stabilize and (r-x_round > args.rounds // 2):
@@ -2116,9 +2453,34 @@ def run_trials(args):
 def parse_args():
     p=argparse.ArgumentParser()
     # Dataset choice
-    p.add_argument("--dataset", type=str, choices=["mnist","cifar10","pathmnist","tissuemnist","organamnist","organsmnist"], default="organsmnist")
+    p.add_argument("--dataset", type=str, choices=["mnist","cifar10","pathmnist","tissuemnist","organamnist","organsmnist","physionet2012","timeseries_csv","synthetic_physio_ts"], default="organsmnist")
     # p.add_argument("--dataset", type=str, choices=["lung","heart","diabetes","mnist","cifar10"], default="lung")
     p.add_argument("--binary", action="store_true", help="Binary version of MNIST/CIFAR-10 (MNIST: 0 vs 1; CIFAR-10: cats vs dogs)")
+
+    # Predictive clinical time-series task options
+    p.add_argument("--physionet2012_dir", type=str, default="./data/physionet2012/set-a",
+                   help="Directory containing PhysioNet/CinC 2012 raw patient .txt files and Outcomes-a.txt.")
+    p.add_argument("--physionet2012_set", type=str, default="a",
+                   help="PhysioNet 2012 set identifier used to locate Outcomes-a.txt, Outcomes-b.txt, etc.")
+    p.add_argument("--physionet2012_target", type=str, default="In-hospital_death",
+                   help="Outcome column for PhysioNet 2012 prediction.")
+    p.add_argument("--ts_csv", type=str, default="./data/clinical_timeseries.csv",
+                   help="Generic long-format time-series CSV path for --dataset timeseries_csv.")
+    p.add_argument("--ts_patient_col", type=str, default="patient_id")
+    p.add_argument("--ts_time_col", type=str, default="time")
+    p.add_argument("--ts_target_col", type=str, default="target")
+    p.add_argument("--ts_feature_cols", type=str, default="",
+                   help="Optional comma-separated feature list for generic time-series CSV.")
+    p.add_argument("--ts_max_len", type=int, default=48,
+                   help="Maximum sequence length/time bins for clinical time-series inputs.")
+    p.add_argument("--ts_test_size", type=float, default=0.2)
+    p.add_argument("--ts_hidden", type=int, default=64)
+    p.add_argument("--ts_layers", type=int, default=1)
+    p.add_argument("--ts_dropout", type=float, default=0.1)
+    p.add_argument("--synthetic_ts_patients", type=int, default=1200,
+                   help="Number of synthetic patients for smoke testing --dataset synthetic_physio_ts.")
+    p.add_argument("--synthetic_ts_features", type=int, default=12,
+                   help="Number of synthetic physiological variables for smoke testing.")
     
 
     # FL config
@@ -2134,11 +2496,11 @@ def parse_args():
     p.add_argument("--rounds", type=int, default=50)
     p.add_argument("--clients", type=int, default=10)
     p.add_argument("--validators", type=int, default=5)
-    p.add_argument("--validator_val_size", type=int, default=1000)
+    p.add_argument("--validator_val_size", type=int, default=2000)
     p.add_argument("--local_epochs", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.005)
-    p.add_argument("--dirichlet_alpha", type=float, default=0.05)
+    p.add_argument("--dirichlet_alpha", type=float, default=0.01)
     p.add_argument("--fedprox_mu", type=float, default=0.001)
 
     # Adaptive weighting
@@ -2148,12 +2510,12 @@ def parse_args():
 
     # kNN-Shapley
     p.add_argument("--knn_k", type=int, default=10)
-    p.add_argument("--knn_sample", type=int, default=1000)
+    p.add_argument("--knn_sample", type=int, default=2000)
 
     # PBFT
     p.add_argument("--pbft_byzantine_rate", type=float, default=0.0000,
                    help="Probability that a validator casts a random vote. This models Byzantine validators, not malicious clients.")
-    p.add_argument("--pbft_acceptance_delta", type=float, default=0.001,
+    p.add_argument("--pbft_acceptance_delta", type=float, default=0.0001,
                    help="Minimum validation metric gain required for a positive PBFT vote.")
 
     # Genuine Byzantine FL client attacks
@@ -2226,15 +2588,15 @@ def parse_args():
 
     # Server stabilization (S2: stronger)
     p.add_argument("--server_clip_norm",   type=float, default=1.8)
-    p.add_argument("--server_prox_mu",     type=float, default=0.02)
-    p.add_argument("--server_momentum",    type=float, default=0.05)
+    p.add_argument("--server_prox_mu",     type=float, default=0.05)
+    p.add_argument("--server_momentum",    type=float, default=0.0005)
     p.add_argument("--server_momentum_end",type=float, default=0.60)
 
     # Anti-drift (S2 only)
     p.add_argument("--anti_drift_weight", type=float, default=0.15)
 
     # Selection / fallback / floors
-    p.add_argument("--min_selected",   type=int,   default=5)
+    p.add_argument("--min_selected",   type=int,   default=7)
     p.add_argument("--max_selected",   type=int,   default=0)     # 0 = no cap
     p.add_argument("--gain_min_threshold", type=float, default=0.001)
     p.add_argument("--weight_floor",   type=float, default=0.008)

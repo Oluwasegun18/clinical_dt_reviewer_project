@@ -1,6 +1,5 @@
 #!/bin/bash -l
 #SBATCH --job-name=pomdt_heterodp
-#SBATCH --partition=ps
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

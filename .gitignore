@@ -30,3 +30,9 @@ slurm-*.out
 .DS_Store
 .vscode/
 .idea/
+/local_results
+plots/*
+plots1/*
+plots2/*
+results/*
+results_ts/*
