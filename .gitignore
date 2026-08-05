@@ -34,5 +34,17 @@ slurm-*.out
 plots/*
 plots1/*
 plots2/*
+plots3/*
 results/*
 results_ts/*
+aligned_fairness_results/*
+dp_fairness_results/*
+new_result/*
+plots_homogeneous_dp/*
+plots_malicious_sensitivity/*
+results_dp_iid_noise/*
+results_dp_reward_fairness/*
+results_homogeneous_dp/*
+results_malicious_sensitivity/*
+results_ts_reward_fairness/*
+

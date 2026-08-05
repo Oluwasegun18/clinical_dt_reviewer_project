@@ -81,6 +81,7 @@ from sklearn.metrics import pairwise_distances
 from collections import defaultdict
 from sklearn.model_selection import train_test_split
 from collections import defaultdict, deque
+from robust_aggregation_corrected_v2_distance_option import robust_aggregate
 
 # print(medmnist.__version__)
 
@@ -1307,7 +1308,23 @@ def knn_shapley_clients(submissions: Dict[int, Dict[str, torch.Tensor]],
                         n_jobs: int = 4,
                         sample: int = 512,
                         device: str = 'cpu',
-                        is_binary: bool = False) -> Dict[int, float]:
+                        is_binary: bool = False,
+                        self_weight: float = 0.7,
+                        return_details: bool = False):
+    """kNN-Shapley proxy with separated raw and normalized scores.
+
+    The previous implementation returned only a max-normalized value. This made
+    the ledger field called raw_shapley already normalized and compressed client
+    differences. This version keeps the unnormalized utility proxy before
+    max-normalization and can return diagnostic fields.
+
+    self_weight controls sensitivity to the client's own validation correctness:
+        local_value = self_weight * self_correctness
+                    + (1 - self_weight) * neighbor_correctness
+
+    With a larger self_weight, a client whose DP noise degrades its own
+    predictions receives a lower raw utility score.
+    """
     # subsample validation
     n = len(val_ds)
     idx = np.random.choice(n, size=min(sample, n), replace=False)
@@ -1320,7 +1337,6 @@ def knn_shapley_clients(submissions: Dict[int, Dict[str, torch.Tensor]],
         out0 = model_fn().to(device)(xb0.to(device))
     num_classes = out0.shape[1]
 
-    # ---- Parallelize predictions per client ----
     def eval_client(cid):
         model = model_fn().to(device)
         model.load_state_dict(submissions[cid])
@@ -1331,19 +1347,12 @@ def knn_shapley_clients(submissions: Dict[int, Dict[str, torch.Tensor]],
                 logits = model(xb.to(device)).detach().cpu()
                 probs = torch.softmax(logits, dim=1).numpy()
                 probs_all.append(probs)
-                if cid == client_ids[0]:  # only first client collects y
+                if cid == client_ids[0]:
                     ys_local.append(yb.numpy())
         return np.vstack(probs_all), (np.concatenate(ys_local) if ys_local else None)
 
-    workers = len(client_ids) if n_jobs == -1 else min(n_jobs, len(client_ids))
     with parallel_backend('threading', n_jobs=n_jobs):
-        results = Parallel()(
-            delayed(eval_client)(cid) for cid in client_ids
-            )
-        # n_jobs=workers, prefer="threads"
-    # results = Parallel(n_jobs=len(client_ids), prefer="threads")(
-    #     delayed(eval_client)(cid) for cid in client_ids
-    # )
+        results = Parallel()(delayed(eval_client)(cid) for cid in client_ids)
 
     P = np.zeros((len(client_ids), len(sub), num_classes), dtype=np.float32)
     ys = None
@@ -1353,33 +1362,57 @@ def knn_shapley_clients(submissions: Dict[int, Dict[str, torch.Tensor]],
             ys = y
     y = ys
 
-    # ---- Vectorized kNN evaluation ----
-    # P shape: [n_clients, n_samples, num_classes]
-    # For each sample t: we want neighbors among client predictions [n_clients, num_classes]
     vals = np.zeros(len(client_ids), dtype=np.float64)
+    self_vals_total = np.zeros(len(client_ids), dtype=np.float64)
+    neigh_vals_total = np.zeros(len(client_ids), dtype=np.float64)
+
+    sw = float(np.clip(self_weight, 0.0, 1.0))
 
     for t in range(len(sub)):
-        feats = P[:, t, :]                 # [n_clients, num_classes]
-        corr = (feats.argmax(axis=1) == y[t]).astype(int)
+        feats = P[:, t, :]
+        corr = (feats.argmax(axis=1) == y[t]).astype(float)
 
-        # --- sanitize feats ---
         feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
         norms = np.linalg.norm(feats, axis=1, keepdims=True)
         feats = feats / np.maximum(norms, 1e-12)
 
-
-        # compute pairwise distances (clients × clients)
         D = pairwise_distances(feats, feats, metric="euclidean")
+        neigh_idx = np.argsort(D, axis=1)[:, 1:k+1]
 
-        # sort neighbors (excluding self)
-        neigh_idx = np.argsort(D, axis=1)[:, 1:k+1]   # top-k neighbors for each client
-        local_vals = corr[neigh_idx].mean(axis=1)
+        if neigh_idx.shape[1] == 0:
+            neighbor_vals = corr.copy()
+        else:
+            neighbor_vals = corr[neigh_idx].mean(axis=1)
+
+        self_vals = corr
+        local_vals = sw * self_vals + (1.0 - sw) * neighbor_vals
+
         vals += local_vals
+        self_vals_total += self_vals
+        neigh_vals_total += neighbor_vals
 
-    vals /= float(len(sub))
-    if vals.max() > 0:
-        vals = vals / vals.max()
-    return {cid: float(vals[j]) for j, cid in enumerate(client_ids)}
+    raw_vals = vals / float(len(sub))
+    self_acc_vals = self_vals_total / float(len(sub))
+    neighbor_vals = neigh_vals_total / float(len(sub))
+
+    if raw_vals.max() > 0:
+        max_norm_vals = raw_vals / raw_vals.max()
+    else:
+        max_norm_vals = raw_vals.copy()
+
+    if return_details:
+        return {
+            cid: {
+                'raw': float(raw_vals[j]),
+                'max_norm': float(max_norm_vals[j]),
+                'self_acc': float(self_acc_vals[j]),
+                'neighbor_score': float(neighbor_vals[j]),
+            }
+            for j, cid in enumerate(client_ids)
+        }
+
+    return {cid: float(max_norm_vals[j]) for j, cid in enumerate(client_ids)}
+
 
 # -------------------------------
 # Aggregation
@@ -1464,24 +1497,26 @@ def bulyan_aggregate(submissions:Dict[int,Dict[str,torch.Tensor]], f:int=1, trim
     selected = sorted(scores, key=scores.get)[:m]
     return trimmed_mean_aggregate({cid: submissions[cid] for cid in selected}, trim_ratio=trim_ratio)
 
-def robust_aggregate(method:str, submissions:Dict[int,Dict[str,torch.Tensor]], args) -> Dict[str,torch.Tensor]:
-    n = len(submissions)
-    f = int(getattr(args, 'robust_f', -1))
-    if f < 0:
-        f = int(math.floor(float(getattr(args, 'malicious_ratio', 0.0)) * n))
-    f = max(0, min(f, max(0, n-1)))
-    method = method.lower()
-    if method == 'median':
-        return coordinate_median_aggregate(submissions)
-    if method == 'trimmed_mean':
-        return trimmed_mean_aggregate(submissions, trim_ratio=getattr(args, 'trim_ratio', 0.2))
-    if method == 'krum':
-        return krum_aggregate(submissions, f=f)
-    if method == 'multikrum':
-        return multikrum_aggregate(submissions, f=f, m=getattr(args, 'multikrum_m', 0))
-    if method == 'bulyan':
-        return bulyan_aggregate(submissions, f=f, trim_ratio=getattr(args, 'trim_ratio', 0.2))
-    raise ValueError(f"Unknown robust aggregation method: {method}")
+# def robust_aggregate(method:str, submissions:Dict[int,Dict[str,torch.Tensor]], args) -> Dict[str,torch.Tensor]:
+#     n = len(submissions)
+#     f = int(getattr(args, 'robust_f', -1))
+#     if f < 0:
+#         f = int(math.floor(float(getattr(args, 'malicious_ratio', 0.0)) * n))
+#     f = max(0, min(f, max(0, n-1)))
+#     method = method.lower()
+#     if method == 'median':
+#         return coordinate_median_aggregate(submissions)
+#     if method == 'trimmed_mean':
+#         return trimmed_mean_aggregate(submissions, trim_ratio=getattr(args, 'trim_ratio', 0.2))
+#     if method == 'krum':
+#         return krum_aggregate(submissions, f=f)
+#     if method == 'multikrum':
+#         return multikrum_aggregate(submissions, f=f, m=getattr(args, 'multikrum_m', 0))
+#     if method == 'bulyan':
+#         return bulyan_aggregate(submissions, f=f, trim_ratio=getattr(args, 'trim_ratio', 0.2))
+#     raise ValueError(f"Unknown robust aggregation method: {method}")
+
+
 
 def intent_aware_aggregate(
     submissions, shapley, relevance, accepted, 
@@ -1816,94 +1851,286 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                                             attack_scale=args.attack_scale, attack_noise_std=args.attack_noise_std,
                                             noise_multiplier=client_noise.get(cid, args.base_noise))
                                          for cid, node in client_nodes.items()}
-                new_state_robust = robust_aggregate(robust_method, client_updates_robust, args)
+                new_state_robust = robust_aggregate(method=robust_method, submissions=client_updates_robust,args= args,reference_state=server_states[robust_method])
                 h = evaluate_model_state(new_state_robust, model_fn, testset, device=DEVICE, is_binary=is_binary)
                 h.update({'attack_type': args.attack_type, 'malicious_ratio': float(args.malicious_ratio),
                           'malicious_clients': len(malicious_clients), 'ablation': 'none'})
                 histories[robust_method].append(h)
                 server_states[robust_method] = new_state_robust
 
-# --- FedSGD one-step ---
-        if 'fedsgd' in run_methods:
-            loss_fn = nn.CrossEntropyLoss()
 
-            # Dict of aggregated gradients
-            grads_sum = {name: torch.zeros_like(param, device='cpu')
-                        for name, param in server_states['fedsgd'].items()}
+        if 'fedsgd' in run_methods:
+            # ---------------------------------------------------------
+            # FedSGD: one global SGD step using aggregated client gradients
+            # ---------------------------------------------------------
+            local_model_template = model_fn().to(DEVICE)
+            param_names = [name for name, _ in local_model_template.named_parameters()]
+
+            grads_sum = {
+                name: torch.zeros_like(param.detach(), device="cpu", dtype=torch.float32)
+                for name, param in local_model_template.named_parameters()
+            }
+
             n_clients = 0
+            total_client_weight = 0.0
+
+            # Select correct loss
+            if is_binary:
+                # Use this only if the model outputs one logit.
+                loss_fn_binary = nn.BCEWithLogitsLoss(reduction="sum")
+                loss_fn_ce = nn.CrossEntropyLoss(reduction="sum")
+            else:
+                loss_fn_ce = nn.CrossEntropyLoss(reduction="sum")
 
             for cid, node in client_nodes.items():
-                loader = node.dataset  # Already a DataLoader
-                try:
-                    xb, yb = next(iter(loader))
-                except StopIteration:
+                loader = node.dataset  # Expected to be a DataLoader
+
+                local_model = model_fn().to(DEVICE)
+                local_model.load_state_dict(server_states['fedsgd'], strict=True)
+                local_model.train()
+                local_model.zero_grad(set_to_none=True)
+
+                local_sample_count = 0
+                client_has_data = False
+
+                for xb, yb in loader:
+                    client_has_data = True
+
+                    xb = xb.to(DEVICE)
+
+                    # Safe label handling for MedMNIST and normal classification
+                    yb = yb.to(DEVICE)
+                    if yb.ndim > 1:
+                        yb = yb.squeeze()
+                    yb = yb.long()
+
+                    if cid in malicious_clients and args.attack_type == 'label_flip' and num_classes > 1:
+                        yb = (yb + int(args.label_flip_shift)) % int(num_classes)
+
+                    logits = local_model(xb)
+
+                    # Binary handling:
+                    # If the model outputs one logit, use BCEWithLogitsLoss.
+                    # If it outputs two logits, use CrossEntropyLoss.
+                    if is_binary and logits.ndim == 2 and logits.shape[1] == 1:
+                        loss = loss_fn_binary(logits.view(-1), yb.float().view(-1))
+                    else:
+                        loss = loss_fn_ce(logits, yb)
+
+                    loss.backward()
+                    local_sample_count += int(xb.shape[0])
+
+                if not client_has_data or local_sample_count == 0:
                     continue
 
-                # Fix MedMNIST labels
-                # yb = yb.squeeze().long()
-
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE).long()
-                if cid in malicious_clients and args.attack_type == 'label_flip' and num_classes > 1:
-                    yb = (yb + int(args.label_flip_shift)) % int(num_classes)
-                local_model = model_fn().to(DEVICE)
-                local_model.load_state_dict(server_states['fedsgd'])
-
-                local_model.zero_grad(set_to_none=True)
-                loss = loss_fn(local_model(xb), yb)
-                loss.backward()
-
-                # Accumulate gradients by key safely
-                for (name, param) in local_model.named_parameters():
+                # Convert summed gradients into average local gradient
+                client_grads = {}
+                for name, param in local_model.named_parameters():
                     if param.grad is None:
                         continue
-                    g = param.grad.detach().cpu()
-                    if cid in malicious_clients and args.attack_type in ('sign_flip', 'scaling', 'random_update', 'gaussian_model_poisoning'):
+                    client_grads[name] = (param.grad.detach().cpu().float() / float(local_sample_count))
+
+                if not client_grads:
+                    continue
+
+                # -----------------------------------------------------
+                # Attack on gradient
+                # -----------------------------------------------------
+                if cid in malicious_clients and args.attack_type in (
+                    'sign_flip',
+                    'scaling',
+                    'random_update',
+                    'gaussian_model_poisoning'
+                ):
+                    for name in list(client_grads.keys()):
+                        g = client_grads[name]
+
                         if args.attack_type == 'sign_flip':
                             g = -float(args.attack_scale) * g
+
                         elif args.attack_type == 'scaling':
                             g = float(args.attack_scale) * g
+
                         elif args.attack_type == 'random_update':
                             g = float(args.attack_scale) * torch.randn_like(g)
+
                         elif args.attack_type == 'gaussian_model_poisoning':
                             g = g + float(args.attack_noise_std) * torch.randn_like(g)
-                    if args.heterogeneous_dp and client_noise.get(cid, 0.0) > 0:
-                        g = g + torch.normal(0.0, client_noise[cid] * args.clip_norm, size=g.shape)
-                    if g.shape == grads_sum[name].shape:  # safety check
-                        grads_sum[name] += g
-                    else:
-                        print(f"[WARNING] Skipping mismatched gradient for {name}: grad{tuple(g.shape)} vs param{tuple(grads_sum[name].shape)}")
 
-                n_clients += 1
+                        client_grads[name] = g
 
-            # Build new FedSGD state
-            new_state_fedsgd = copy.deepcopy(server_states['fedsgd'])
-            if n_clients > 0:
-                for name, param in new_state_fedsgd.items():
-                    grad = grads_sum[name] / n_clients
+                # -----------------------------------------------------
+                # Client-level clipping: clip full client gradient vector
+                # -----------------------------------------------------
+                max_norm = float(getattr(args, 'clip_norm', 2.0))
 
-                    # Clip
-                    max_norm = getattr(args, 'clip_norm', 2.0)
-                    grad_norm = grad.norm()
-                    if grad_norm > max_norm:
-                        grad = grad * (max_norm / (grad_norm + 1e-6))
+                total_norm_sq = 0.0
+                for g in client_grads.values():
+                    total_norm_sq += float(torch.sum(g * g).item())
 
-                    # Gaussian Noise for DP
-                    if getattr(args, 'base_noise', 0) > 0:
-                        grad += torch.normal(
+                total_norm = math.sqrt(total_norm_sq)
+
+                clip_coef = min(1.0, max_norm / (total_norm + 1e-12))
+                for name in client_grads:
+                    client_grads[name] = client_grads[name] * clip_coef
+
+                # -----------------------------------------------------
+                # DP noise: homogeneous or heterogeneous
+                # Add once at client-gradient level
+                # -----------------------------------------------------
+                if getattr(args, 'heterogeneous_dp', False):
+                    noise_multiplier = float(client_noise.get(cid, 0.0))
+                else:
+                    noise_multiplier = float(getattr(args, 'base_noise', 0.0))
+
+                if noise_multiplier > 0:
+                    for name in client_grads:
+                        client_grads[name] = client_grads[name] + torch.normal(
                             mean=0.0,
-                            std=args.base_noise * max_norm,
-                            size=grad.shape
+                            std=noise_multiplier * max_norm,
+                            size=client_grads[name].shape,
+                            device=client_grads[name].device
                         )
 
-                    # SGD update
-                    new_state_fedsgd[name] = param - args.lr * grad
+                # -----------------------------------------------------
+                # Aggregate client gradient
+                # Use sample-size weighting or equal-client weighting.
+                # For FedSGD, sample-size weighting is more standard.
+                # -----------------------------------------------------
+                client_weight = float(local_sample_count)
 
-            # Evaluate
-            h = evaluate_model_state(new_state_fedsgd, model_fn, testset, device=DEVICE, is_binary=is_binary)
-            h.update({'attack_type': args.attack_type, 'malicious_ratio': float(args.malicious_ratio),
-                      'malicious_clients': len(malicious_clients), 'ablation': 'none'})
+                for name, g in client_grads.items():
+                    grads_sum[name] += client_weight * g
+
+                total_client_weight += client_weight
+                n_clients += 1
+
+            # ---------------------------------------------------------
+            # Apply global SGD update
+            # ---------------------------------------------------------
+            new_state_fedsgd = copy.deepcopy(server_states['fedsgd'])
+
+            if n_clients > 0 and total_client_weight > 0:
+                for name in param_names:
+                    if name not in grads_sum:
+                        continue
+
+                    grad = grads_sum[name] / float(total_client_weight)
+
+                    # Update only trainable parameter tensors
+                    new_state_fedsgd[name] = (
+                        new_state_fedsgd[name].detach().cpu().float()
+                        - float(args.lr) * grad
+                    ).to(dtype=server_states['fedsgd'][name].dtype)
+
+            # Keep non-parameter buffers unchanged
+            h = evaluate_model_state(
+                new_state_fedsgd,
+                model_fn,
+                testset,
+                device=DEVICE,
+                is_binary=is_binary
+            )
+
+            h.update({
+                'attack_type': args.attack_type,
+                'malicious_ratio': float(args.malicious_ratio),
+                'malicious_clients': len(malicious_clients),
+                'ablation': 'none',
+                'selected': n_clients,
+            })
+
             histories['fedsgd'].append(h)
             server_states['fedsgd'] = new_state_fedsgd
+
+
+
+
+
+
+
+
+# # --- FedSGD one-step ---
+#         if 'fedsgd' in run_methods:
+#             loss_fn = nn.CrossEntropyLoss()
+
+#             # Dict of aggregated gradients
+#             grads_sum = {name: torch.zeros_like(param, device='cpu')
+#                         for name, param in server_states['fedsgd'].items()}
+#             n_clients = 0
+
+#             for cid, node in client_nodes.items():
+#                 loader = node.dataset  # Already a DataLoader
+#                 try:
+#                     xb, yb = next(iter(loader))
+#                 except StopIteration:
+#                     continue
+
+#                 # Fix MedMNIST labels
+#                 # yb = yb.squeeze().long()
+
+#                 xb, yb = xb.to(DEVICE), yb.to(DEVICE).long()
+#                 if cid in malicious_clients and args.attack_type == 'label_flip' and num_classes > 1:
+#                     yb = (yb + int(args.label_flip_shift)) % int(num_classes)
+#                 local_model = model_fn().to(DEVICE)
+#                 local_model.load_state_dict(server_states['fedsgd'])
+
+#                 local_model.zero_grad(set_to_none=True)
+#                 loss = loss_fn(local_model(xb), yb)
+#                 loss.backward()
+
+#                 # Accumulate gradients by key safely
+#                 for (name, param) in local_model.named_parameters():
+#                     if param.grad is None:
+#                         continue
+#                     g = param.grad.detach().cpu()
+#                     if cid in malicious_clients and args.attack_type in ('sign_flip', 'scaling', 'random_update', 'gaussian_model_poisoning'):
+#                         if args.attack_type == 'sign_flip':
+#                             g = -float(args.attack_scale) * g
+#                         elif args.attack_type == 'scaling':
+#                             g = float(args.attack_scale) * g
+#                         elif args.attack_type == 'random_update':
+#                             g = float(args.attack_scale) * torch.randn_like(g)
+#                         elif args.attack_type == 'gaussian_model_poisoning':
+#                             g = g + float(args.attack_noise_std) * torch.randn_like(g)
+#                     if args.heterogeneous_dp and client_noise.get(cid, 0.0) > 0:
+#                         g = g + torch.normal(0.0, client_noise[cid] * args.clip_norm, size=g.shape)
+#                     if g.shape == grads_sum[name].shape:  # safety check
+#                         grads_sum[name] += g
+#                     else:
+#                         print(f"[WARNING] Skipping mismatched gradient for {name}: grad{tuple(g.shape)} vs param{tuple(grads_sum[name].shape)}")
+
+#                 n_clients += 1
+
+#             # Build new FedSGD state
+#             new_state_fedsgd = copy.deepcopy(server_states['fedsgd'])
+#             if n_clients > 0:
+#                 for name, param in new_state_fedsgd.items():
+#                     grad = grads_sum[name] / n_clients
+
+#                     # Clip
+#                     max_norm = getattr(args, 'clip_norm', 2.0)
+#                     grad_norm = grad.norm()
+#                     if grad_norm > max_norm:
+#                         grad = grad * (max_norm / (grad_norm + 1e-6))
+
+#                     # Gaussian Noise for DP
+#                     if getattr(args, 'base_noise', 0) > 0:
+#                         grad += torch.normal(
+#                             mean=0.0,
+#                             std=args.base_noise * max_norm,
+#                             size=grad.shape
+#                         )
+
+#                     # SGD update
+#                     new_state_fedsgd[name] = param - args.lr * grad
+
+#             # Evaluate
+#             h = evaluate_model_state(new_state_fedsgd, model_fn, testset, device=DEVICE, is_binary=is_binary)
+#             h.update({'attack_type': args.attack_type, 'malicious_ratio': float(args.malicious_ratio),
+#                       'malicious_clients': len(malicious_clients), 'ablation': 'none'})
+#             histories['fedsgd'].append(h)
+#             server_states['fedsgd'] = new_state_fedsgd
 
 
         # --- Adaptive full model and ablation variants --------------------------------
@@ -1928,7 +2155,7 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                     base_state_pbft[k] = acc_param / float(len(hist_deque))
 
             # (1) Local updates + simulated communication latency.
-            latency_this_round, compute_time_this_round, comm_lat_this_round = {}, {}, {}
+            latency_this_round, compute_time_this_round, comm_lat_this_round, dp_lat_this_round = {}, {}, {}, {}
             for cid, node in client_nodes.items():
                 t0 = time.time()
                 update = node.local_update(
@@ -1948,9 +2175,36 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                     comm_latency = tx_time + jitter
                 else:
                     comm_latency = 0.0
-                total_lat = local_compute + comm_latency
-                compute_time_this_round[cid] = local_compute
-                comm_lat_this_round[cid] = comm_latency
+                # DP-noise-induced latency overhead. Gaussian DP noise changes
+                # tensor values, but any additional noise-generation, privacy
+                # accounting, secure verification, or system processing delay
+                # must be explicitly modeled.
+                dp_noise_used = float(client_noise.get(cid, args.base_noise))
+                dp_noise_power = dp_noise_used ** float(args.dp_latency_power)
+
+                # Backward-compatible total DP overhead.
+                dp_latency_legacy = float(args.dp_latency_coeff) * dp_noise_power
+
+                # Optional decomposition of DP overhead into computation and
+                # transmission/communication burden. These coefficients make the
+                # latency model explicit instead of assuming tensor noise alone
+                # changes wall-clock time.
+                dp_compute_overhead = float(getattr(args, "dp_compute_latency_coeff", 0.0)) * dp_noise_power
+                dp_comm_overhead = float(getattr(args, "dp_comm_latency_coeff", 0.0)) * dp_noise_power
+
+                dp_compute_overhead = max(0.0, float(dp_compute_overhead))
+                dp_comm_overhead = max(0.0, float(dp_comm_overhead))
+                dp_latency_legacy = max(0.0, float(dp_latency_legacy))
+
+                dp_latency = dp_latency_legacy + dp_compute_overhead + dp_comm_overhead
+
+                effective_compute = local_compute + dp_compute_overhead
+                effective_comm = comm_latency + dp_comm_overhead
+                total_lat = effective_compute + effective_comm + dp_latency_legacy
+
+                compute_time_this_round[cid] = effective_compute
+                comm_lat_this_round[cid] = effective_comm
+                dp_lat_this_round[cid] = dp_latency
                 latency_this_round[cid] = total_lat
 
             # (2) Base metrics once + relevance per-client.
@@ -1962,6 +2216,7 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
             base_val = float(np.mean([m[base_key] for m in base_metrics_all]))
 
             relevance = {}
+            client_quality = {}
             for cid, st in client_updates.items():
                 with parallel_backend('threading', n_jobs=args.n_jobs):
                     metrics = Parallel(n_jobs=args.n_jobs, prefer="threads")(
@@ -1969,6 +2224,14 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                     )
                 rel_vals = [clinical_relevance(m, domain_for_rel) for m in metrics]
                 relevance[cid] = float(np.mean(rel_vals))
+
+                # Direct submitted-model quality, logged to verify whether
+                # DP noise actually degrades client predictions.
+                metric_keys = set().union(*[set(m.keys()) for m in metrics]) if metrics else set()
+                client_quality[cid] = {
+                    key: float(np.mean([float(m.get(key, 0.0)) for m in metrics]))
+                    for key in metric_keys
+                }
 
             # (3) PBFT model-quality validation.
             def eval_client_candidate(cid, st):
@@ -2007,6 +2270,8 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                     'attack_type': args.attack_type,
                     'malicious_ratio': float(args.malicious_ratio),
                     'dp_noise_multiplier': float(client_noise.get(cid, args.base_noise)),
+                    'dp_latency_sec': float(dp_lat_this_round.get(cid, 0.0)),
+                    'total_latency_sec': float(latency_this_round.get(cid, 0.0)),
                 })
 
             # (4) Fallback selection. For adversarial experiments, this fallback is disabled by default
@@ -2035,11 +2300,23 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                         selected.append(cid); accepted[cid] = True; need -= 1
 
             # (5) kNN-Shapley contribution proxy.
-            shapley = knn_shapley_clients(
+            # Keep raw, max-normalized, and diagnostic scores separate.
+            shapley_details = knn_shapley_clients(
                 client_updates, validators[0].dataset, model_fn,
                 k=args.knn_k, n_jobs=args.n_jobs, sample=args.knn_sample,
-                device=str(DEVICE), is_binary=is_binary
+                device=str(DEVICE), is_binary=is_binary,
+                self_weight=args.shapley_self_weight,
+                return_details=True
             )
+            raw_shapley = {cid: float(v.get('raw', 0.0)) for cid, v in shapley_details.items()}
+            shapley_max_norm = {cid: float(v.get('max_norm', 0.0)) for cid, v in shapley_details.items()}
+            shapley_self_acc = {cid: float(v.get('self_acc', 0.0)) for cid, v in shapley_details.items()}
+            shapley_neighbor_score = {cid: float(v.get('neighbor_score', 0.0)) for cid, v in shapley_details.items()}
+
+            # Backward-compatible variable used by aggregation. This remains
+            # bounded in [0, 1], while raw_shapley is logged separately.
+            shapley = shapley_max_norm
+            shapley_contrib_norm = normalize_nonnegative(raw_shapley, cids=sorted(client_updates.keys()))
 
             # (6) Variance penalty.
             deltas = {}
@@ -2061,6 +2338,13 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                 var_penalty = {cid: 1.0 for cid in client_updates.keys()}
 
             # (7) Aggregation according to the selected ablation mode.
+            # Snapshot trust before the round-level trust-memory update.
+            # This is the trust value actually used for aggregation/reward scoring.
+            trust_scores_this_round = {
+                cid: float(trust_scores[adaptive_method].get(cid, 0.0))
+                for cid in client_updates.keys()
+            }
+
             tau_r = temperature_schedule(r, args.rounds, args.temp_start, args.temp_mid, args.temp_end)
             if args.stability_mode == "S2":
                 tau_r *= 0.8
@@ -2084,7 +2368,7 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                 else:
                     alpha_eff, beta_eff = args.alpha, args.beta
                     mg_scaled = {cid: args.gamma_model_gain * float(model_gain.get(cid, 0.0)) for cid in client_updates.keys()}
-                    trust_scaled = {cid: args.lambda_trust * float(trust_scores[adaptive_method].get(cid, 0.0)) for cid in client_updates.keys()}
+                    trust_scaled = {cid: args.lambda_trust * float(trust_scores_this_round.get(cid, 0.0)) for cid in client_updates.keys()}
 
                 new_state_adaptive, weights_adaptive, cid_order, raw_logits = intent_aware_aggregate(
                     client_updates, shapley, relevance, accepted,
@@ -2125,7 +2409,7 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                 ema = 0.01
 
             # for dir_alpha = 0.01 x_round = 5, for  dir_alpha = 0.05 x_round = 10
-            x_round=6 #0<= x_round<=0 rounds/2 :: This is to adjust the round in which the momentum starts, such that the momentum starts at round, total_round/2 + x_round 
+            x_round=15 #0<= x_round<=0 rounds/2 :: This is to adjust the round in which the momentum starts, such that the momentum starts at round, total_round/2 + x_round 
             if args.final_stabilize and (r-x_round > args.rounds // 2):
                 denom = max(1, args.rounds // 2)
                 ema = args.server_momentum + ((r-x_round-args.rounds // 2)/denom)*(args.server_momentum-args.server_momentum_end)
@@ -2143,7 +2427,20 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
             rejected_bad = [cid for cid in bad if not accepted.get(cid, False)]
             accepted_honest = [cid for cid in honest if accepted.get(cid, False)]
             reward_by_client = {cid: float(w) for cid, w in zip(cid_order, weights_adaptive)}
-            contrib_norm = normalize_nonnegative(shapley, cids=sorted(client_updates.keys()))
+
+            # Fairness target for metrics: normalized intent-aware contribution over all submitted clients.
+            # This target combines Shapley, clinical relevance, model gain, and trust.
+            intent_raw_for_fairness = {
+                cid: max(
+                    0.0,
+                    float(args.alpha) * max(0.0, float(shapley_max_norm.get(cid, 0.0)))
+                    + float(args.beta) * float(relevance.get(cid, 0.0))
+                    + float(args.gamma_model_gain) * float(model_gain.get(cid, 0.0))
+                    + float(args.lambda_trust) * float(trust_scores_this_round.get(cid, 0.0))
+                )
+                for cid in client_updates.keys()
+            }
+            contrib_norm = normalize_nonnegative(intent_raw_for_fairness, cids=sorted(client_updates.keys()))
             fairness = reward_fairness_metrics(contrib_norm, reward_by_client)
             malicious_reward_share = float(sum(reward_by_client.get(cid, 0.0) for cid in bad))
             hist_metrics.update({
@@ -2171,40 +2468,152 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
                 trust_scores[adaptive_method][cid] = float(max(args.trust_floor, min(1.0, new_t)))
 
             # (11) Incentives/rewards ledger for contribution and privacy-fairness analysis.
-            if args.incentives == "all" and len(cid_order) > 0:
-                shap_vals = np.array([max(0.0, shapley.get(cid, 0.0)) for cid in cid_order], dtype=np.float64)
+            if args.incentives == "all" and len(client_updates) > 0:
+                # Reward population controls which clients are considered by the incentive rules.
+                # For the DP-noise fairness experiment, use --reward_population all so that
+                # Shapley, Equal, Latency, and Proposed rewards are all defined over every
+                # submitted client, not only the aggregation-selected clients.
+                if args.reward_population == "all":
+                    reward_cids = sorted(client_updates.keys())
+                elif args.reward_population == "accepted":
+                    reward_cids = sorted([cid for cid in client_updates.keys() if accepted.get(cid, False)])
+                    if len(reward_cids) == 0:
+                        reward_cids = sorted(client_updates.keys())
+                elif args.reward_population == "aggregated":
+                    reward_cids = list(cid_order)
+                    if len(reward_cids) == 0:
+                        reward_cids = sorted(client_updates.keys())
+                else:
+                    raise ValueError(f"Unknown reward_population: {args.reward_population}")
+
+                # Shapley-only reward over the selected reward population.
+                shap_vals = np.array([max(0.0, shapley.get(cid, 0.0)) for cid in reward_cids], dtype=np.float64)
                 shap_sum = shap_vals.sum()
                 rew_shap = shap_vals / shap_sum if shap_sum > 0 else np.ones_like(shap_vals) / len(shap_vals)
-                rew_equal = np.ones_like(shap_vals) / len(shap_vals)
-                eps_t = 1e-6
-                times = np.array([latency_this_round.get(cid, 1.0) for cid in cid_order], dtype=np.float64)
-                inv = 1.0 / np.clip(times, eps_t, None)
-                inv_sum = inv.sum()
-                rew_lat = inv / inv_sum if inv_sum > 0 else np.ones_like(inv) / len(inv)
-                rew_prop = np.array(weights_adaptive, dtype=np.float64)
 
-                for j, cid in enumerate(cid_order):
+                # Equal reward over the selected reward population.
+                rew_equal = np.ones_like(shap_vals) / len(shap_vals)
+
+                # Latency reward over the selected reward population.
+                # compensation: higher total latency receives higher compensation.
+                # efficiency: lower total latency receives higher reward.
+                eps_t = 1e-6
+                times = np.array([latency_this_round.get(cid, 1.0) for cid in reward_cids], dtype=np.float64)
+                if args.latency_reward_mode == "compensation":
+                    lat_scores = np.clip(times, eps_t, None)
+                elif args.latency_reward_mode == "efficiency":
+                    lat_scores = 1.0 / np.clip(times, eps_t, None)
+                else:
+                    raise ValueError(f"Unknown latency_reward_mode: {args.latency_reward_mode}")
+                lat_sum = lat_scores.sum()
+                rew_lat = lat_scores / lat_sum if lat_sum > 0 else np.ones_like(lat_scores) / len(lat_scores)
+
+                # Intent-aware contribution target over the same reward population.
+                intent_raw = {}
+                for cid in reward_cids:
+                    s_raw = max(0.0, float(shapley_max_norm.get(cid, 0.0)))
+                    r_raw = float(relevance.get(cid, 0.0))
+                    g_raw = float(model_gain.get(cid, 0.0))
+                    t_raw = float(trust_scores_this_round.get(cid, 0.0))
+                    intent_raw[cid] = max(
+                        0.0,
+                        float(args.alpha) * s_raw
+                        + float(args.beta) * r_raw
+                        + float(args.gamma_model_gain) * g_raw
+                        + float(args.lambda_trust) * t_raw
+                    )
+                intent_contrib_norm = normalize_nonnegative(intent_raw, cids=reward_cids)
+
+                # Proposed reward. Benchmarks above still use all reward_cids.
+                agg_weight_by_client = {cid: float(w) for cid, w in zip(cid_order, weights_adaptive)}
+                mode = getattr(args, "proposed_reward_mode", "aggregation_weight")
+                if mode == "aggregation_weight":
+                    # Actual aggregation influence. Non-aggregated clients get zero reward.
+                    rew_prop_dict = {cid: max(0.0, float(agg_weight_by_client.get(cid, 0.0))) for cid in reward_cids}
+                    rew_prop_dict = normalize_nonnegative(rew_prop_dict, cids=reward_cids)
+                elif mode == "contribution_share":
+                    # Contribution-proportional incentive.
+                    rew_prop_dict = dict(intent_contrib_norm)
+                elif mode == "reward_softmax":
+                    # Reward-specific softmax. This decouples incentive sharpness from aggregation temperature.
+                    raw_arr = np.array([intent_raw.get(cid, 0.0) for cid in reward_cids], dtype=np.float64)
+                    tau_reward = max(1e-6, float(getattr(args, "reward_temperature", 0.1)))
+                    logits = raw_arr / tau_reward
+                    logits = logits - logits.max()
+                    exps = np.exp(logits)
+                    vals = exps / np.clip(exps.sum(), 1e-12, None)
+                    rew_prop_dict = {cid: float(vals[j]) for j, cid in enumerate(reward_cids)}
+                else:
+                    raise ValueError(f"Unknown proposed_reward_mode: {mode}")
+
+                for j, cid in enumerate(reward_cids):
+                    trust_raw = float(trust_scores_this_round.get(cid, 0.0))
+                    shap_raw = max(0.0, float(raw_shapley.get(cid, 0.0)))
+                    shap_norm_raw = max(0.0, float(shapley_max_norm.get(cid, 0.0)))
+                    rel_raw = float(relevance.get(cid, 0.0))
+                    gain_raw = float(model_gain.get(cid, 0.0))
+                    q_metrics = client_quality.get(cid, {})
                     incentives_all_rounds.append({
                         'round': r,
                         'method': adaptive_method,
                         'ablation': ablation_mode,
                         'client': cid,
                         'accepted': int(accepted.get(cid, False)),
+                        'aggregated': int(cid in set(cid_order)),
+                        'reward_population': args.reward_population,
+                        'proposed_reward_mode': mode,
                         'is_malicious': int(cid in malicious_clients),
                         'attack_type': args.attack_type,
                         'malicious_ratio': float(args.malicious_ratio),
                         'dp_noise_multiplier': float(client_noise.get(cid, args.base_noise)),
-                        'contribution_score': float(contrib_norm.get(cid, 0.0)),
-                        'raw_shapley': float(shapley.get(cid, 0.0)),
-                        'relevance': float(relevance.get(cid, 0.0)),
-                        'model_gain': float(model_gain.get(cid, 0.0)),
+
+                        # Shapley contribution fields.
+                        # raw_shapley is the unnormalized utility proxy before max-normalization.
+                        # shapley_max_norm is the bounded score used by the aggregation module.
+                        # contribution_score is the normalized Shapley reward share over submitted clients.
+                        'contribution_score': float(shapley_contrib_norm.get(cid, 0.0)),
+                        'raw_shapley': float(raw_shapley.get(cid, 0.0)),
+                        'shapley_max_norm': float(shapley_max_norm.get(cid, 0.0)),
+                        'shapley_self_acc': float(shapley_self_acc.get(cid, 0.0)),
+                        'shapley_neighbor_score': float(shapley_neighbor_score.get(cid, 0.0)),
+                        'shapley_self_weight': float(args.shapley_self_weight),
+
+                        # Direct submitted-model validation quality.
+                        'client_val_acc': float(q_metrics.get('acc', 0.0)),
+                        'client_val_auc': float(q_metrics.get('auc', 0.0)),
+                        'client_val_precision': float(q_metrics.get('precision', 0.0)),
+                        'client_val_recall': float(q_metrics.get('recall', 0.0)),
+                        'client_val_f1': float(q_metrics.get('f1', 0.0)),
+                        'client_val_loss': float(q_metrics.get('loss', 0.0)),
+
+                        # Intent-aware contribution fields.
+                        'relevance': rel_raw,
+                        'model_gain': gain_raw,
+                        'trust_score': trust_raw,
+                        'alpha': float(args.alpha),
+                        'beta': float(args.beta),
+                        'gamma_model_gain': float(args.gamma_model_gain),
+                        'lambda_trust': float(args.lambda_trust),
+                        'intent_shapley_component': float(args.alpha) * shap_norm_raw,
+                        'intent_relevance_component': float(args.beta) * rel_raw,
+                        'intent_model_gain_component': float(args.gamma_model_gain) * gain_raw,
+                        'intent_trust_component': float(args.lambda_trust) * trust_raw,
+                        'intent_contribution_raw': float(intent_raw.get(cid, 0.0)),
+                        'intent_contribution_score': float(intent_contrib_norm.get(cid, 0.0)),
+
+                        # Reward rules.
                         'reward_shapley': float(rew_shap[j]),
                         'reward_equal': float(rew_equal[j]),
                         'reward_latency': float(rew_lat[j]),
-                        'reward_proposed': float(rew_prop[j]),
+                        'reward_proposed': float(rew_prop_dict.get(cid, 0.0)),
+
                         'compute_time_sec': float(compute_time_this_round.get(cid, 0.0)),
                         'comm_latency_sec': float(comm_lat_this_round.get(cid, 0.0)),
-                        'total_latency_sec': float(latency_this_round.get(cid, 0.0))
+                        'dp_latency_sec': float(dp_lat_this_round.get(cid, 0.0)),
+                        'total_latency_sec': float(latency_this_round.get(cid, 0.0)),
+                        'dp_latency_coeff': float(args.dp_latency_coeff),
+                        'dp_latency_power': float(args.dp_latency_power),
+                        'latency_reward_mode': args.latency_reward_mode
                     })
 
             print(f"[{adaptive_method} | Round {r}] acc={hist_metrics['acc']:.4f} base={base_val:.4f} "
@@ -2486,7 +2895,7 @@ def parse_args():
     # FL config
     method_choices = ["adaptive","fedavg","fedprox","fedsgd"] + list(ROBUST_METHODS) #+ list(ADAPTIVE_METHODS.keys())
     method_choices = sorted(set(method_choices))
-    p.add_argument("--method", type=str, nargs="+", choices=method_choices, default=["adaptive"],
+    p.add_argument("--method", type=str, nargs="+", choices=method_choices, default=["adaptive","fedavg","fedprox","fedsgd"],
                    help="One or more methods. Robust baselines and adaptive ablation variants are supported.")
     p.add_argument("--run_all", action="store_true", help="Run primary methods in one call", default=False)
     p.add_argument("--run_robust_baselines", action="store_true", default=False,
@@ -2496,26 +2905,30 @@ def parse_args():
     p.add_argument("--rounds", type=int, default=50)
     p.add_argument("--clients", type=int, default=10)
     p.add_argument("--validators", type=int, default=5)
-    p.add_argument("--validator_val_size", type=int, default=2000)
+    p.add_argument("--validator_val_size", type=int, default=500)
     p.add_argument("--local_epochs", type=int, default=2)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=0.003)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=0.005)
     p.add_argument("--dirichlet_alpha", type=float, default=0.05)
     p.add_argument("--fedprox_mu", type=float, default=0.001)
 
     # Adaptive weighting
     p.add_argument("--alpha", type=float, default=0.1)  # Shapley weight
     p.add_argument("--beta", type=float, default=0.9)   # Relevance weight
-    p.add_argument("--agg_temperature", type=float, default=20.0)
+    p.add_argument("--agg_temperature", type=float, default=0.1)
 
     # kNN-Shapley
     p.add_argument("--knn_k", type=int, default=10)
-    p.add_argument("--knn_sample", type=int, default=2000)
+    p.add_argument("--knn_sample", type=int, default=1000)
+    p.add_argument("--shapley_self_weight", type=float, default=0.7,
+                   help=("Weight assigned to each client's own validation correctness in the "
+                         "kNN-Shapley proxy. Larger values make Shapley more sensitive to "
+                         "DP-noise-induced prediction degradation."))
 
     # PBFT
     p.add_argument("--pbft_byzantine_rate", type=float, default=0.0000,
                    help="Probability that a validator casts a random vote. This models Byzantine validators, not malicious clients.")
-    p.add_argument("--pbft_acceptance_delta", type=float, default=0.0001,
+    p.add_argument("--pbft_acceptance_delta", type=float, default=-0.0001,
                    help="Minimum validation metric gain required for a positive PBFT vote.")
 
     # Genuine Byzantine FL client attacks
@@ -2532,12 +2945,14 @@ def parse_args():
                    help="Allow min_selected fallback even when attack_type != none. By default it is disabled so rejection-rate metrics remain meaningful.")
 
     # Robust aggregation baselines
-    p.add_argument("--robust_f", type=int, default=-1,
+    p.add_argument("--robust_f", type=int, default=2,
                    help="Assumed number of Byzantine clients for Krum/Multi-Krum/Bulyan. -1 derives it from malicious_ratio.")
     p.add_argument("--trim_ratio", type=float, default=0.2,
                    help="Trim ratio for coordinate-wise trimmed mean and approximate Bulyan.")
     p.add_argument("--multikrum_m", type=int, default=0,
                    help="Number of updates selected by Multi-Krum. 0 uses n-f-2.")
+    p.add_argument("--krum_distance", type=str,  default="squared_l2", choices=["squared_l2", "l2"],
+                    help="Distance used in Krum/Multi-Krum scoring. Use squared_l2 for canonical Krum.")
 
     # DP
     p.add_argument("--clip_norm", type=float, default=2.0)
@@ -2551,6 +2966,24 @@ def parse_args():
     p.add_argument("--incentives", type=str, default="all",
                 choices=["none","all"],
                 help="If 'all', compute & log Shapley-only, Equal, Latency-based, and Proposed rewards.")
+
+    # Reward-fairness experiment controls.
+    # Use --reward_population all for the DP-noise fairness experiment so that
+    # Shapley, Equal, Latency, and Proposed rewards are defined over every
+    # submitted client, not only the accepted/aggregated clients.
+    p.add_argument("--reward_population", type=str, default="all",
+                choices=["all", "accepted", "aggregated"],
+                help="Client set used to compute incentive rewards in the ledger.")
+
+    p.add_argument("--proposed_reward_mode", type=str, default="reward_softmax",
+                choices=["aggregation_weight", "contribution_share", "reward_softmax"],
+                help=("How to compute reward_proposed in the incentive ledger: "
+                      "aggregation_weight uses actual aggregation weights; "
+                      "contribution_share equals normalized intent contribution; "
+                      "reward_softmax applies a reward-specific softmax."))
+
+    p.add_argument("--reward_temperature", type=float, default=0.1,
+                help="Temperature used only when --proposed_reward_mode reward_softmax.")
     p.add_argument("--latency_mode", type=str, default="simulate",
                 choices=["simulate","off"],
                 help="How to obtain communication latency. 'simulate' uses model size / bandwidth + jitter.")
@@ -2558,6 +2991,22 @@ def parse_args():
                 help="Assumed uplink bandwidth in Mbps for simulate latency.")
     p.add_argument("--latency_jitter_ms", type=float, default=20.0,
                 help="Added lognormal jitter (ms) around simulated latency.")
+    p.add_argument("--dp_latency_coeff", type=float, default=0.0,
+                help=("Backward-compatible total DP latency overhead coefficient. The added "
+                      "legacy overhead is dp_latency_coeff * (dp_noise_multiplier ** dp_latency_power)."))
+    p.add_argument("--dp_compute_latency_coeff", type=float, default=0.0,
+                help=("DP-induced computation overhead coefficient. This models extra noise generation, "
+                      "privacy accounting, clipping/verification, or secure-processing burden."))
+    p.add_argument("--dp_comm_latency_coeff", type=float, default=0.0,
+                help=("DP-induced communication/transmission overhead coefficient. This models extra "
+                      "privacy metadata, secure transfer, or noisy-update handling burden."))
+    p.add_argument("--dp_latency_power", type=float, default=1.0,
+                help="Exponent used in the DP-noise-induced latency overhead model.")
+    p.add_argument("--latency_reward_mode", type=str, default="efficiency",
+                choices=["compensation", "efficiency"],
+                help=("Latency reward rule. efficiency gives higher reward to lower-latency clients "
+                      "and therefore penalizes DP-induced latency burden; compensation gives higher "
+                      "reward to higher-latency clients."))
     
      # Parallelization
     p.add_argument("--n_jobs", type=int, default=1,
@@ -2596,7 +3045,7 @@ def parse_args():
     p.add_argument("--anti_drift_weight", type=float, default=0.15)
 
     # Selection / fallback / floors
-    p.add_argument("--min_selected",   type=int,   default=5)
+    p.add_argument("--min_selected",   type=int,   default=6)
     p.add_argument("--max_selected",   type=int,   default=0)     # 0 = no cap
     p.add_argument("--gain_min_threshold", type=float, default=0.001)
     p.add_argument("--weight_floor",   type=float, default=0.008)

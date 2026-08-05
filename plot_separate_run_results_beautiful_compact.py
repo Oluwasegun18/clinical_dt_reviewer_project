@@ -514,10 +514,10 @@ def plot_metric_curves(
             x,
             y_smooth,
             label=label,
-            linewidth=3.8,
-            linestyle=linestyle,
+            linewidth=2.3,
+            # linestyle=linestyle,
             marker=marker,
-            markersize=6.2,
+            markersize=3.2,
             markerfacecolor="white",
             markeredgewidth=1.4,
             markevery=markevery,
@@ -550,9 +550,9 @@ def plot_metric_curves(
     ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title)
-    ax.grid(True, axis="y", alpha=0.25, linewidth=0.8)
-    ax.grid(True, axis="x", alpha=0.10, linewidth=0.6)
-    legend = ax.legend(loc="best", fontsize=12, ncol=1, handlelength=2.8, borderpad=0.6, labelspacing=0.35)
+    # ax.grid(True, axis="y", alpha=0.25, linewidth=0.8)
+    # ax.grid(True, axis="x", alpha=0.10, linewidth=0.6)
+    legend = ax.legend(loc="best", fontsize=12, ncol=1, handlelength=2.8, borderpad=0.6, labelspacing=0.35,framealpha=0.5)
     legend.get_frame().set_linewidth(0.8)
 
     if max_round is not None:
@@ -694,7 +694,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_dir", default=OUT_DIR, help="Output folder for plots and compiled CSVs")
     parser.add_argument("--metrics", nargs="+", default=["acc", "auc", "precision", "recall", "f1", "loss"], help="Metrics to plot")
     parser.add_argument("--smooth", choices=["none", "rolling", "rolling_center", "ema", "savgol"], default="rolling", help="Smoothing method")
-    parser.add_argument("--window", type=int, default=5, help="Rolling/Savitzky-Golay smoothing window")
+    parser.add_argument("--window", type=int, default=10, help="Rolling/Savitzky-Golay smoothing window")
     parser.add_argument("--ema_alpha", type=float, default=0.25, help="EMA smoothing alpha")
     parser.add_argument("--max_round", type=int, default=50, help="Optional maximum round for x-axis and filtering")
     parser.add_argument("--min_round", type=int, default=None, help="Optional minimum round for filtering")
@@ -702,7 +702,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_std", action="store_true", help="Disable standard deviation bands when multiple trials exist")
     parser.add_argument("--skip_bar_metrics", nargs="+", default=["acc", "test_acc"], help="Metrics for which final bar plots should not be generated. Default skips accuracy bars.")
     parser.add_argument("--no_final_bars", action="store_true", help="Disable all final bar plots and only save line plots.")
-    parser.add_argument("--marker_every_points", type=int, default=10, help="Approximate number of visible markers per line.")
+    parser.add_argument("--marker_every_points", type=int, default=50, help="Approximate number of visible markers per line.")
     parser.add_argument("--paper", action="store_true", help="Use paper-ready matplotlib settings")
     return parser.parse_args()
 

@@ -49,8 +49,8 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 # Editable default paths, matching your example style
 # -----------------------------------------------------------------------------
-ADAPTIVE_DIR = "results1/organsmnist/trial3c"
-BENCHMARK_DIR = "results1/organsmnist/trial2"
+ADAPTIVE_DIR = None #"results1/organsmnist/trial3c"
+BENCHMARK_DIR = None #"results1/organsmnist/trial2"
 ABLATION_DIR = None  # e.g., "results1/organsmnist/ablation1"
 OUT_DIR = "plots1"
 

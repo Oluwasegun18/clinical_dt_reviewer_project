@@ -1788,7 +1788,7 @@ def run_single_trial(args, seed:int, run_methods:List[str]):
             if r < 5:
                 ema = 0.001 #0.01
             # for dir_alpha = 0.01 x_round = 5, for  dir_alpha = 0.05 x_round = 10
-            x_round=20 #0<= x_round<=0 rounds/2 :: This is to adjust the round in which the momentum starts, such that the momentum starts at round, total_round/2 + x_round 
+            x_round=15 #0<= x_round<=0 rounds/2 :: This is to adjust the round in which the momentum starts, such that the momentum starts at round, total_round/2 + x_round 
             if args.final_stabilize and (r-x_round > args.rounds // 2):
                 denom = max(1, args.rounds // 2)
                 ema = args.server_momentum + ((r-x_round-args.rounds // 2)/denom)*(args.server_momentum-args.server_momentum_end)
@@ -2144,7 +2144,7 @@ def parse_args():
     # Adaptive weighting
     p.add_argument("--alpha", type=float, default=0.1)  # Shapley weight
     p.add_argument("--beta", type=float, default=0.9)   # Relevance weight
-    p.add_argument("--agg_temperature", type=float, default=20.0)
+    p.add_argument("--agg_temperature", type=float, default=200.0)
 
     # kNN-Shapley
     p.add_argument("--knn_k", type=int, default=10)
@@ -2164,13 +2164,13 @@ def parse_args():
                    help="Scale used by sign-flip, scaling and random-update attacks.")
     p.add_argument("--attack_noise_std", type=float, default=5.0,
                    help="Noise std multiplier for Gaussian model-poisoning attacks.")
-    p.add_argument("--label_flip_shift", type=int, default=1,
+    p.add_argument("--label_flip_shift", type=int, default=2,
                    help="Class shift used by label-flipping malicious clients.")
     p.add_argument("--allow_fallback_under_attack", dest="disable_fallback_under_attack", action="store_false", default=False,
                    help="Allow min_selected fallback even when attack_type != none. By default it is disabled so rejection-rate metrics remain meaningful.")
 
     # Robust aggregation baselines
-    p.add_argument("--robust_f", type=int, default=-1,
+    p.add_argument("--robust_f", type=int, default=2,
                    help="Assumed number of Byzantine clients for Krum/Multi-Krum/Bulyan. -1 derives it from malicious_ratio.")
     p.add_argument("--trim_ratio", type=float, default=0.2,
                    help="Trim ratio for coordinate-wise trimmed mean and approximate Bulyan.")
@@ -2179,7 +2179,7 @@ def parse_args():
 
     # DP
     p.add_argument("--clip_norm", type=float, default=2.0)
-    p.add_argument("--base_noise", type=float, default=0.0005)
+    p.add_argument("--base_noise", type=float, default=0.005)
     p.add_argument("--heterogeneous_dp", action="store_true", default=False,
                    help="Use client-specific DP noise multipliers to simulate heterogeneous hospital privacy requirements.")
     p.add_argument("--dp_noise_multipliers", type=str, default="",
@@ -2228,7 +2228,7 @@ def parse_args():
     p.add_argument("--server_clip_norm",   type=float, default=1.8)
     p.add_argument("--server_prox_mu",     type=float, default=0.02)
     p.add_argument("--server_momentum",    type=float, default=0.05)
-    p.add_argument("--server_momentum_end",type=float, default=0.60)
+    p.add_argument("--server_momentum_end",type=float, default=0.50)
 
     # Anti-drift (S2 only)
     p.add_argument("--anti_drift_weight", type=float, default=0.15)
